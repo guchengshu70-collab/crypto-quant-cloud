@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+.smtp_pass.txt
+verify_local.py
+user_signal_image.png
