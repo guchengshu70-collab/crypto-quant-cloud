@@ -188,7 +188,7 @@ async def run_check() -> int:
 
 
 def main() -> int:
-    if "--test-mail" in sys.argv:
+    if os.environ.get("CHECKER_MODE") == "test-mail" or "--test-mail" in sys.argv:
         send_mail("【crypto-quant】测试邮件",
                   "这是一封来自云端信号监视器的测试邮件。\n收到即代表 SMTP 配置正常，后续有新信号会发到这里。\n\n—— crypto-quant 信号监视器")
         print("[checker] 测试邮件已发送")
