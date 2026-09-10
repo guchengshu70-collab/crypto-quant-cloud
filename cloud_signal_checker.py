@@ -121,7 +121,7 @@ def send_mail(subject: str, body: str) -> None:
     host = os.environ["MAIL_HOST"]
     port = int(os.environ.get("MAIL_PORT", "465"))
     user = os.environ["MAIL_USER"]
-    pwd = os.environ["MAIL_PASS"]
+    pwd = os.environ["MAIL_PASS"].replace("\ufeff", "").strip()  # 防御 BOM/空白污染
     to = [x.strip() for x in os.environ["MAIL_TO"].split(",") if x.strip()]
     if not to:
         raise RuntimeError("MAIL_TO 为空")
