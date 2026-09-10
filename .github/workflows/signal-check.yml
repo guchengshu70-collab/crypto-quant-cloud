@@ -4,6 +4,15 @@ on:
   schedule:
     - cron: '*/15 * * * *'   # 每15分钟检查一次
   workflow_dispatch:          # 支持手动触发
+    inputs:
+      mode:
+        description: '运行模式'
+        required: true
+        default: 'check'
+        type: choice
+        options:
+          - check
+          - test-mail
 
 permissions:
   contents: write
@@ -22,6 +31,7 @@ jobs:
       - name: Run signal check (EXP3 + EXP4-S @ 4h)
         run: python cloud_signal_checker.py
         env:
+          CHECKER_MODE: ${{ inputs.mode }}
           MAIL_HOST: ${{ secrets.MAIL_HOST }}
           MAIL_PORT: ${{ secrets.MAIL_PORT }}
           MAIL_USER: ${{ secrets.MAIL_USER }}
