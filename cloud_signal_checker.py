@@ -106,7 +106,11 @@ class CloudRest:
         params = {"symbol": symbol.upper(), "interval": interval, "limit": min(int(limit), 1000)}
         if end_ts:
             params["endTime"] = int(end_ts)
-        raw = await self._get("/fapi/v1/klines", params)
+        try:
+            raw = await self._get("/fapi/v1/klines", params)
+        except Exception as exc:
+            print(f"  [rest] {symbol} {interval} K线获取失败: {exc}")
+            return []
         return [
             {"t": int(k[0]), "o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
              "c": float(k[4]), "v": float(k[5]), "close_ts": int(k[6]), "is_closed": True}
@@ -114,15 +118,29 @@ class CloudRest:
         ]
 
     async def market_pool(self) -> list[str]:
-        """全市场 USDT 永续，按 24h 成交额降序（与原客户端 _scan_pool 的 REST 分支一致）。"""
-        data = await self._get("/fapi/v1/ticker/24hr")
-        arr = sorted(
-            (t for t in data if str(t.get("symbol", "")).endswith("USDT")
-             and float(t.get("quoteVolume", 0) or 0) > 0),
-            key=lambda t: float(t.get("quoteVolume", 0) or 0), reverse=True,
-        )
-        pool = [t["symbol"] for t in arr]
-        print(f"[checker] 全市场 USDT 永续币池: {len(pool)} 个")
+        """全市场 USDT 永续币池（与原客户端 _scan_pool 一致）。
+        主路径：ticker/24hr 按成交额降序；若该端点被地域限制(451)则降级用 exchangeInfo。"""
+        try:
+            data = await self._get("/fapi/v1/ticker/24hr")
+            arr = sorted(
+                (t for t in data if str(t.get("symbol", "")).endswith("USDT")
+                 and float(t.get("quoteVolume", 0) or 0) > 0),
+                key=lambda t: float(t.get("quoteVolume", 0) or 0), reverse=True,
+            )
+            pool = [t["symbol"] for t in arr]
+            if pool:
+                print(f"[checker] 全市场 USDT 永续币池: {len(pool)} 个（按24h成交额降序）")
+                return pool
+        except Exception as exc:
+            print(f"[checker] ticker/24hr 不可用({exc})，降级用 exchangeInfo")
+
+        info = await self._get("/fapi/v1/exchangeInfo")
+        syms = info.get("symbols", []) if isinstance(info, dict) else []
+        pool = [s["symbol"] for s in syms
+                if s.get("quoteAsset") == "USDT"
+                and s.get("contractType") == "PERPETUAL"
+                and s.get("status") == "TRADING"]
+        print(f"[checker] 全市场 USDT 永续币池(exchangeInfo 兜底): {len(pool)} 个")
         return pool
 
 
