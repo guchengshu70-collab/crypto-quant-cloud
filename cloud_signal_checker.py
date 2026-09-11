@@ -54,9 +54,9 @@ CST = timezone(timedelta(hours=8))
 
 
 class RateLimiter:
-    """简单令牌桶限流：保护币安 REST 配额（约 15 req/s = 1800 weight/min < 2400 上限）。"""
+    """简单令牌桶限流：保护 OKX 公共接口配额（约 8 req/s < OKX 限制 10 req/s）。"""
 
-    def __init__(self, rate: float = 15.0, burst: int = 30) -> None:
+    def __init__(self, rate: float = 8.0, burst: int = 20) -> None:
         self.rate = rate
         self.burst = burst
         self.tokens = float(burst)
@@ -74,73 +74,78 @@ class RateLimiter:
 
 
 class CloudRest:
-    """极简币安 REST 客户端（K线 + 全市场 24h 快照；GitHub 海外 runner 直连，无需代理）。"""
+    """OKX REST 客户端（K线 + 币池；GitHub 海外 runner 与国内均可直连）。
+    数据源说明：币安 fapi 对 GitHub runner 的 IP 返回 451（地域封锁），故云端改用 OKX
+    公共行情。信号算法（quant_research）完全不变，仅行情来源不同，主流币信号与币安基本一致。"""
 
-    BASE = "https://fapi.binance.com"
+    BASE = "https://www.okx.com"
 
     def __init__(self) -> None:
         self._session = requests.Session()
         self._limiter = RateLimiter()
 
-    async def _get(self, path: str, params: dict | None = None, retries: int = 3) -> list | dict:
+    @staticmethod
+    def to_inst(symbol: str) -> str:
+        return f"{symbol.replace('USDT', '')}-USDT-SWAP"
+
+    async def _get(self, path: str, params: dict | None = None, retries: int = 3) -> dict:
         url = f"{self.BASE}{path}"
         for attempt in range(retries):
             await self._limiter.acquire()
             try:
                 resp = self._session.get(url, params=params, timeout=25)
-                if resp.status_code in (418, 429):
+                if resp.status_code == 429:
                     wait = 5 * (attempt + 1)
-                    print(f"  [rest] {resp.status_code} 限流，等待 {wait}s 重试")
+                    print(f"  [rest] 429 限流，等待 {wait}s 重试")
                     await asyncio.sleep(wait)
                     continue
                 resp.raise_for_status()
-                return resp.json()
+                data = resp.json()
+                if data.get("code") not in ("0", 0):
+                    raise RuntimeError(f"OKX code={data.get('code')} msg={data.get('msg')}")
+                return data
             except requests.exceptions.RequestException as exc:
                 if attempt == retries - 1:
                     raise
                 await asyncio.sleep(2 * (attempt + 1))
         raise RuntimeError(f"GET {path} 失败")
 
-    async def klines(self, symbol: str, interval: str = "5m", limit: int = 500,
+    async def klines(self, symbol: str, interval: str = "4H", limit: int = 300,
                      end_ts: int | None = None) -> list[dict]:
-        params = {"symbol": symbol.upper(), "interval": interval, "limit": min(int(limit), 1000)}
+        bar = interval.upper() if interval[-1] not in "m" else interval
+        params = {"instId": self.to_inst(symbol), "bar": bar, "limit": min(int(limit), 300)}
         if end_ts:
-            params["endTime"] = int(end_ts)
+            params["after"] = str(int(end_ts))
         try:
-            raw = await self._get("/fapi/v1/klines", params)
+            data = await self._get("/api/v5/market/candles", params)
         except Exception as exc:
             print(f"  [rest] {symbol} {interval} K线获取失败: {exc}")
             return []
-        return [
-            {"t": int(k[0]), "o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
-             "c": float(k[4]), "v": float(k[5]), "close_ts": int(k[6]), "is_closed": True}
-            for k in raw
-        ]
+        rows = data.get("data", []) or []
+        rows = list(reversed(rows))  # OKX 返回倒序（最新在前），转正序
+        out = []
+        for k in rows:
+            if len(k) > 8 and k[8] != "1":
+                continue  # 与原客户端一致：只用已收盘K线（confirm=1）
+            ts = int(k[0])
+            out.append({"t": ts, "o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
+                        "c": float(k[4]), "v": float(k[5]), "close_ts": ts, "is_closed": True})
+        return out
 
     async def market_pool(self) -> list[str]:
-        """全市场 USDT 永续币池（与原客户端 _scan_pool 一致）。
-        主路径：ticker/24hr 按成交额降序；若该端点被地域限制(451)则降级用 exchangeInfo。"""
+        """OKX 全市场 USDT 永续（state=live），按 24h 成交额降序。"""
+        inst = await self._get("/api/v5/public/instruments",
+                               {"instType": "SWAP", "quoteCcy": "USDT", "state": "live"})
+        pool = [i["instId"].replace("-USDT-SWAP", "")
+                for i in inst.get("data", [])
+                if i.get("settleCcy") == "USDT"]
         try:
-            data = await self._get("/fapi/v1/ticker/24hr")
-            arr = sorted(
-                (t for t in data if str(t.get("symbol", "")).endswith("USDT")
-                 and float(t.get("quoteVolume", 0) or 0) > 0),
-                key=lambda t: float(t.get("quoteVolume", 0) or 0), reverse=True,
-            )
-            pool = [t["symbol"] for t in arr]
-            if pool:
-                print(f"[checker] 全市场 USDT 永续币池: {len(pool)} 个（按24h成交额降序）")
-                return pool
+            tk = await self._get("/api/v5/market/tickers", {"instType": "SWAP"})
+            vol = {t["instId"]: float(t.get("volCcyQuote24h", 0) or 0) for t in tk.get("data", [])}
+            pool.sort(key=lambda s: vol.get(f"{s}-USDT-SWAP", 0), reverse=True)
         except Exception as exc:
-            print(f"[checker] ticker/24hr 不可用({exc})，降级用 exchangeInfo")
-
-        info = await self._get("/fapi/v1/exchangeInfo")
-        syms = info.get("symbols", []) if isinstance(info, dict) else []
-        pool = [s["symbol"] for s in syms
-                if s.get("quoteAsset") == "USDT"
-                and s.get("contractType") == "PERPETUAL"
-                and s.get("status") == "TRADING"]
-        print(f"[checker] 全市场 USDT 永续币池(exchangeInfo 兜底): {len(pool)} 个")
+            print(f"  [rest] tickers 排序不可用({exc})，使用交易所顺序")
+        print(f"[checker] OKX 全市场 USDT 永续币池: {len(pool)} 个（按24h成交额降序）")
         return pool
 
 
