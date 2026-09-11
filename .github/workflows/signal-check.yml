@@ -38,13 +38,3 @@ jobs:
           MAIL_PASS: ${{ secrets.MAIL_PASS }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
           WATCH_SYMBOLS: ${{ vars.WATCH_SYMBOLS }}
-      - name: Commit notified state
-        run: |
-          git config user.name "crypto-quant-bot"
-          git config user.email "crypto-quant-bot@users.noreply.github.com"
-          git add state/notified.json
-          git diff --cached --quiet && exit 0
-          git commit -m "chore: update notified signal state [skip ci]"
-          git push
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
