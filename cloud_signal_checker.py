@@ -8,6 +8,7 @@
 与客户端「4小时」页签严格对齐：
   - 仅 EXP3（趋势内回调均值回归）与 EXP4-S（一次性EMA20止盈+1h扩容）两套策略
   - 聚焦 4h 级别（交易级 4h + 偏置级 12h），复用 mtf_tamr.scan_universe(tf="4h")
+  - 扫盘币池 = 全市场 USDT 永续（按 24h 成交额降序），与原客户端 _scan_pool 一致
 
 环境变量（必填；密钥只走环境变量/Secrets，不进代码）：
   MAIL_HOST      SMTP 服务器（QQ邮箱：smtp.qq.com）
@@ -40,7 +41,7 @@ sys.path.insert(0, str(ROOT / "src" / "features"))
 sys.path.insert(0, str(ROOT / "quant_research"))
 
 STATE_FILE = ROOT / "state" / "notified.json"
-STATE_MAX = 200  # 只保留最近 200 条指纹，防止状态文件无限增长
+STATE_MAX = 500  # 全市场扫描下保留更多指纹，防止状态文件过快增长
 
 DEFAULT_SYMBOLS = "BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT,BNBUSDT,DOGEUSDT,ADAUSDT,LTCUSDT,AVAXUSDT,LINKUSDT"
 
@@ -52,27 +53,77 @@ STRATEGY_LABEL = {"exp3": "EXP3", "exp4": "EXP4-S"}
 CST = timezone(timedelta(hours=8))
 
 
+class RateLimiter:
+    """简单令牌桶限流：保护币安 REST 配额（约 15 req/s = 1800 weight/min < 2400 上限）。"""
+
+    def __init__(self, rate: float = 15.0, burst: int = 30) -> None:
+        self.rate = rate
+        self.burst = burst
+        self.tokens = float(burst)
+        self.updated = time.monotonic()
+
+    async def acquire(self) -> None:
+        while True:
+            now = time.monotonic()
+            self.tokens = min(self.burst, self.tokens + (now - self.updated) * self.rate)
+            self.updated = now
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                return
+            await asyncio.sleep(0.05)
+
+
 class CloudRest:
-    """极简币安 REST 客户端（仅K线；GitHub 海外 runner 直连，无需代理）。"""
+    """极简币安 REST 客户端（K线 + 全市场 24h 快照；GitHub 海外 runner 直连，无需代理）。"""
 
     BASE = "https://fapi.binance.com"
 
     def __init__(self) -> None:
         self._session = requests.Session()
+        self._limiter = RateLimiter()
+
+    async def _get(self, path: str, params: dict | None = None, retries: int = 3) -> list | dict:
+        url = f"{self.BASE}{path}"
+        for attempt in range(retries):
+            await self._limiter.acquire()
+            try:
+                resp = self._session.get(url, params=params, timeout=25)
+                if resp.status_code in (418, 429):
+                    wait = 5 * (attempt + 1)
+                    print(f"  [rest] {resp.status_code} 限流，等待 {wait}s 重试")
+                    await asyncio.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                return resp.json()
+            except requests.exceptions.RequestException as exc:
+                if attempt == retries - 1:
+                    raise
+                await asyncio.sleep(2 * (attempt + 1))
+        raise RuntimeError(f"GET {path} 失败")
 
     async def klines(self, symbol: str, interval: str = "5m", limit: int = 500,
                      end_ts: int | None = None) -> list[dict]:
         params = {"symbol": symbol.upper(), "interval": interval, "limit": min(int(limit), 1000)}
         if end_ts:
             params["endTime"] = int(end_ts)
-        resp = self._session.get(f"{self.BASE}/fapi/v1/klines", params=params, timeout=20)
-        resp.raise_for_status()
-        raw = resp.json()
+        raw = await self._get("/fapi/v1/klines", params)
         return [
             {"t": int(k[0]), "o": float(k[1]), "h": float(k[2]), "l": float(k[3]),
              "c": float(k[4]), "v": float(k[5]), "close_ts": int(k[6]), "is_closed": True}
             for k in raw
         ]
+
+    async def market_pool(self) -> list[str]:
+        """全市场 USDT 永续，按 24h 成交额降序（与原客户端 _scan_pool 的 REST 分支一致）。"""
+        data = await self._get("/fapi/v1/ticker/24hr")
+        arr = sorted(
+            (t for t in data if str(t.get("symbol", "")).endswith("USDT")
+             and float(t.get("quoteVolume", 0) or 0) > 0),
+            key=lambda t: float(t.get("quoteVolume", 0) or 0), reverse=True,
+        )
+        pool = [t["symbol"] for t in arr]
+        print(f"[checker] 全市场 USDT 永续币池: {len(pool)} 个")
+        return pool
 
 
 # ---------------- 去重状态 ----------------
@@ -146,14 +197,21 @@ def send_mail(subject: str, body: str) -> None:
 async def run_check() -> int:
     from features.mtf_tamr import scan_universe
 
-    symbols = [x.strip().upper() for x in
-               os.environ.get("WATCH_SYMBOLS", DEFAULT_SYMBOLS).split(",") if x.strip()]
+    rest = CloudRest()
+
+    # 币池：默认全市场 USDT 永续；若显式设置 WATCH_SYMBOLS 则只用列表（调试用）
+    watch = os.environ.get("WATCH_SYMBOLS", "").strip()
+    if watch:
+        symbols = [x.strip().upper() for x in watch.split(",") if x.strip()]
+        print(f"[checker] 使用显式关注列表: {len(symbols)} 个")
+    else:
+        symbols = await rest.market_pool()
     if not symbols:
-        print("[checker] WATCH_SYMBOLS 为空，跳过")
+        print("[checker] 币池为空，跳过")
         return 0
 
-    rest = CloudRest()
     rows: list[dict] = []
+    t0 = time.monotonic()
     for strat in STRATEGIES:
         print(f"[checker] 策略 {strat} @ {FOCUS_TF} 扫描 {len(symbols)} 个币种 …")
         r = await scan_universe(rest, None, symbols, settings=None,
@@ -161,7 +219,8 @@ async def run_check() -> int:
         for x in r:
             x["strategy"] = strat
         rows.extend(r)
-    print(f"[checker] 本轮可执行信号 {len(rows)} 条")
+        print(f"[checker] {strat} 产出 {len(r)} 条信号，累计耗时 {time.monotonic()-t0:.0f}s")
+    print(f"[checker] 本轮可执行信号 {len(rows)} 条（耗时 {time.monotonic()-t0:.0f}s）")
 
     if not rows:
         return 0
