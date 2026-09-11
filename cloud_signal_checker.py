@@ -50,6 +50,9 @@ STRATEGIES = ("exp3", "exp4")
 FOCUS_TF = "4h"
 STRATEGY_LABEL = {"exp3": "EXP3", "exp4": "EXP4-S"}
 
+# 邮件通知总开关：默认关闭（扫描与去重照常运行，便于随时开启且不重复通知）
+MAIL_ENABLED = os.environ.get("MAIL_ENABLED", "0") == "1"
+
 CST = timezone(timedelta(hours=8))
 
 
@@ -277,7 +280,16 @@ async def run_check() -> int:
         print("[checker] 均为已通知信号，不发邮件")
         return 0
 
-    print(f"[checker] 新信号 {len(new)} 条，发送邮件…")
+    print(f"[checker] 新信号 {len(new)} 条")
+
+    if not MAIL_ENABLED:
+        # 邮件关闭：仅把新信号计入去重状态，避免日后开启时重复轰炸
+        print("[checker] 邮件通知已关闭（MAIL_ENABLED=0），本轮信号仅记录不发送")
+        for r in new:
+            old.add(fingerprint(r))
+        save_state(old)
+        return len(new)
+
     MAX_IN_MAIL = 25  # 邮件正文最多列 25 条，其余合并提示，避免超长邮件
     body = "crypto-quant 云端信号监视（OKX 行情 / EXP3+EXP4-S @ 4h）\n" + "=" * 40 + "\n\n"
     for i, r in enumerate(new[:MAX_IN_MAIL], 1):
