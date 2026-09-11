@@ -218,7 +218,7 @@ def send_mail(subject: str, body: str) -> None:
 # ---------------- 主检查流程 ----------------
 
 async def run_check() -> int:
-    from features.mtf_tamr import scan_universe
+    from features.mtf_tamr import MultiTFCache, scan_universe
 
     rest = CloudRest()
 
@@ -235,9 +235,10 @@ async def run_check() -> int:
 
     rows: list[dict] = []
     t0 = time.monotonic()
+    cache = MultiTFCache()  # exp3/exp4 共享同一份K线缓存，请求量减半
     for strat in STRATEGIES:
         print(f"[checker] 策略 {strat} @ {FOCUS_TF} 扫描 {len(symbols)} 个币种 …")
-        r = await scan_universe(rest, None, symbols, settings=None,
+        r = await scan_universe(rest, cache, symbols, settings=None,
                                 limit=len(symbols), tf=FOCUS_TF, strategy=strat)
         for x in r:
             x["strategy"] = strat
@@ -255,9 +256,12 @@ async def run_check() -> int:
         return 0
 
     print(f"[checker] 新信号 {len(new)} 条，发送邮件…")
-    body = "crypto-quant 云端信号监视\n" + "=" * 40 + "\n\n"
-    for i, r in enumerate(new, 1):
+    MAX_IN_MAIL = 25  # 邮件正文最多列 25 条，其余合并提示，避免超长邮件
+    body = "crypto-quant 云端信号监视（OKX 行情 / EXP3+EXP4-S @ 4h）\n" + "=" * 40 + "\n\n"
+    for i, r in enumerate(new[:MAX_IN_MAIL], 1):
         body += f"【{i}】\n" + fmt_signal(r) + "\n\n"
+    if len(new) > MAX_IN_MAIL:
+        body += f"…… 其余 {len(new) - MAX_IN_MAIL} 条信号已省略（共 {len(new)} 条）\n\n"
     body += "-" * 40 + "\n本邮件由程序自动生成，信号仅供学习研究参考，不构成投资建议。"
 
     send_mail(f"【crypto-quant 信号】{len(new)} 条新信号", body)
@@ -276,7 +280,8 @@ def main() -> int:
         print("[checker] 测试邮件已发送")
         return 0
     try:
-        return asyncio.run(run_check())
+        asyncio.run(run_check())
+        return 0  # 正常完成（无论有无信号）一律返回 0，避免被 Actions 判为失败
     except Exception as exc:
         print(f"[checker] 执行出错: {exc}", file=sys.stderr)
         return 2
