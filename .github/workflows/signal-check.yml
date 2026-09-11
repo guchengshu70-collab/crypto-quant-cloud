@@ -2,7 +2,7 @@ name: crypto-quant-signal-monitor
 
 on:
   schedule:
-    - cron: '*/15 * * * *'   # 每15分钟检查一次
+    - cron: '*/30 * * * *'   # 每30分钟全市场扫描一轮（全市场约500+币，单轮耗时较长）
   workflow_dispatch:          # 支持手动触发
     inputs:
       mode:
@@ -20,7 +20,7 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
