@@ -164,6 +164,28 @@ def save_state(fps: set[str]) -> None:
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     data = {"updated": datetime.now(CST).isoformat(), "notified": sorted(fps)[-STATE_MAX:]}
     STATE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    _git_push_state()
+
+
+def _git_push_state() -> None:
+    """把去重状态提交回仓库（依赖 runner 自带 git + actions/checkout 的 GITHUB_TOKEN 凭据）。"""
+    import subprocess
+    try:
+        subprocess.run(["git", "add", "state/notified.json"], capture_output=True, timeout=30)
+        diff = subprocess.run(["git", "diff", "--cached", "--quiet"], capture_output=True, timeout=30)
+        if diff.returncode == 0:
+            return  # 无变更
+        subprocess.run(["git", "config", "user.name", "crypto-quant-bot"],
+                       capture_output=True, timeout=30)
+        subprocess.run(["git", "config", "user.email",
+                        "crypto-quant-bot@users.noreply.github.com"], capture_output=True, timeout=30)
+        subprocess.run(["git", "commit", "-m", "chore: update notified signal state [skip ci]"],
+                       capture_output=True, timeout=30)
+        push = subprocess.run(["git", "push"], capture_output=True, timeout=60)
+        if push.returncode != 0:
+            print(f"[checker] 状态提交失败: {push.stderr.decode()[:200]}")
+    except Exception as exc:
+        print(f"[checker] 状态提交异常: {exc}")
 
 
 def fingerprint(sig: dict) -> str:
